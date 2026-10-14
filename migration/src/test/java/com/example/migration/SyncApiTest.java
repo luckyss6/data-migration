@@ -15,6 +15,7 @@ import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
 
 import com.example.migration.config.DataSourceConfig;
+import com.example.migration.support.TestSchema;
 
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -64,15 +65,16 @@ class SyncApiTest {
 
 	@BeforeEach
 	void reset() {
-		this.target.execute("DROP TABLE IF EXISTS t_order");
-		this.target.execute("DELETE FROM sync_table_config");
-		this.target.update("INSERT INTO sync_table_config (target_table, remark) VALUES ('t_order', 'api test')");
-		String snapshot = snapshot();
-		this.source.execute("DROP TABLE IF EXISTS " + snapshot);
-		this.source.execute("CREATE TABLE " + snapshot + " (ID NUMBER(10) NOT NULL, ORDER_NO VARCHAR2(60) NOT NULL, "
+		TestSchema.createSyncTableConfig(this.source);
+		this.target.execute("DROP TABLE IF EXISTS " + targetTable());
+		this.source.execute("DELETE FROM sync_table_config");
+		this.source.update("INSERT INTO sync_table_config (source_table, remark) VALUES ('t_order', 'api test')");
+		String sourceTable = sourceTable();
+		this.source.execute("DROP TABLE IF EXISTS " + sourceTable);
+		this.source.execute("CREATE TABLE " + sourceTable + " (ID NUMBER(10) NOT NULL, ORDER_NO VARCHAR2(60) NOT NULL, "
 				+ "AMOUNT NUMBER(12,2), REMARK CLOB, UPDATE_TIME TIMESTAMP(3), PRIMARY KEY (ID))");
 		for (int id = 1; id <= 3; id++) {
-			this.source.update("INSERT INTO " + snapshot
+			this.source.update("INSERT INTO " + sourceTable
 					+ " (ID, ORDER_NO, AMOUNT, REMARK, UPDATE_TIME) VALUES (?, ?, ?, ?, ?)", (long) id, "ORD-" + id,
 					new BigDecimal("10.50"), "remark", Timestamp.valueOf(T1));
 		}
@@ -84,16 +86,15 @@ class SyncApiTest {
 
 		assertThat(response.statusCode()).isEqualTo(200);
 		assertThat(response.body()).contains("\"status\":\"SUCCESS\"")
-				.contains("\"table\":\"t_order\"")
-				.contains("\"written\":3")
-				.contains("\"watermark\":\"2026-10-01T08:00:00\"");
+				.contains("\"table\":\"" + targetTable() + "\"")
+				.contains("\"written\":3");
 		// the run really copied the rows and created the missing target table
-		assertThat(this.target.queryForObject("SELECT COUNT(*) FROM t_order", Long.class)).isEqualTo(3);
+		assertThat(this.target.queryForObject("SELECT COUNT(*) FROM " + targetTable(), Long.class)).isEqualTo(3);
 	}
 
 	@Test
 	void postSyncRunWithAnEmptyConfigReturnsNoTableResults() throws Exception {
-		this.target.execute("DELETE FROM sync_table_config");
+		this.source.execute("DELETE FROM sync_table_config");
 
 		HttpResponse<String> response = post("/sync/run");
 
@@ -103,16 +104,18 @@ class SyncApiTest {
 
 	@Test
 	void postSyncRunReportsFailingTables() throws Exception {
-		// required_col is not part of the snapshot, so every insert into t_order fails
-		this.target.execute("DROP TABLE IF EXISTS t_order");
-		this.target.execute("CREATE TABLE t_order (id BIGINT NOT NULL PRIMARY KEY, order_no VARCHAR(60) NOT NULL, "
+		// required_col is not part of the source table, so every insert into the target fails
+		this.target.execute("DROP TABLE IF EXISTS " + targetTable());
+		this.target.execute("CREATE TABLE " + targetTable()
+				+ " (id BIGINT NOT NULL PRIMARY KEY, order_no VARCHAR(60) NOT NULL, "
 				+ "amount DECIMAL(12,2) NULL, remark LONGTEXT NULL, update_time DATETIME(3) NULL, "
 				+ "required_col VARCHAR(10) NOT NULL)");
 
 		HttpResponse<String> response = post("/sync/run");
 
 		assertThat(response.statusCode()).isEqualTo(200);
-		assertThat(response.body()).contains("\"status\":\"FAILED\"", "\"table\":\"t_order\"", "\"written\":0");
+		assertThat(response.body()).contains("\"status\":\"FAILED\"", "\"table\":\"" + targetTable() + "\"",
+				"\"written\":0");
 	}
 
 	private HttpResponse<String> post(String path) throws Exception {
@@ -125,8 +128,14 @@ class SyncApiTest {
 		return "http://localhost:" + this.environment.getProperty("local.server.port");
 	}
 
-	private static String snapshot() {
-		return "T_ORDER" + DateTimeFormatter.BASIC_ISO_DATE.format(RUN_DATE);
+	/** Table as it exists in the source database. */
+	private static String sourceTable() {
+		return "T_ORDER";
+	}
+
+	/** Table the engine writes to, source table name plus the run date. */
+	private static String targetTable() {
+		return "t_order" + DateTimeFormatter.BASIC_ISO_DATE.format(RUN_DATE);
 	}
 
 }

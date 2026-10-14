@@ -2,14 +2,10 @@ package com.example.migration.sync;
 
 import java.sql.ResultSet;
 import java.sql.SQLException;
-import java.sql.Timestamp;
 import java.time.Clock;
-import java.time.Duration;
 import java.time.LocalDate;
-import java.time.LocalDateTime;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Optional;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -30,12 +26,14 @@ import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.support.TransactionTemplate;
 
 /**
- * Copies the tables listed in {@code sync_table_config} from Oracle into MySQL.
+ * Copies the tables listed in the {@code sync_table_config} table of the source into the matching
+ * snapshot tables of MySQL.
  *
- * <p>Per table: the watermark is the highest value of the watermark column that the target table
- * already contains, rows newer than that are read page by page and written as one idempotent JDBC
- * batch per page. Records that cannot be written are logged and skipped, a failing page fails that
- * table - since nothing of it was committed, the next run retries the same range.
+ * <p>Every run rebuilds the target table of the run date completely: its previous content is deleted
+ * first, then the rows are read page by page in cursor order and written as one JDBC batch per page.
+ * Running the same day twice therefore ends with exactly the source content - rows the source dropped
+ * in the meantime disappear, nothing is duplicated. Records that cannot be written are logged and
+ * skipped, a failing page fails that table.
  */
 @Service
 public class TableSyncService {
@@ -76,32 +74,33 @@ public class TableSyncService {
 	}
 
 	/**
-	 * The tables to copy: the target tables of {@code sync_table_config} that have a snapshot for the
-	 * run date, see {@code migration.source-table-pattern}. Missing snapshots are skipped.
+	 * The tables to copy: the source tables of {@code sync_table_config} that really exist in the
+	 * source. The target table of each of them is derived from the run date, see
+	 * {@code migration.target-table-pattern}. Tables that are not there are skipped.
 	 */
 	public List<SyncTable> tables() {
 		LocalDate date = snapshotDate();
 		List<SyncTable> resolved = new ArrayList<>();
-		for (String targetTable : this.config.findEnabledTargetTables()) {
+		for (String sourceTable : this.config.findEnabledSourceTables()) {
 			try {
-				this.tableFactory.resolve(targetTable, date).ifPresent(resolved::add);
+				this.tableFactory.resolve(sourceTable, date).ifPresent(resolved::add);
 			}
 			catch (RuntimeException ex) {
-				logger.error("Skipping target table {}: {}", targetTable, ex.getMessage());
+				logger.error("Skipping source table {}: {}", sourceTable, ex.getMessage());
 			}
 		}
-		logger.info("{} table(s) to synchronise from the snapshot of {}", resolved.size(), date);
+		logger.info("{} table(s) to synchronise into the snapshot of {}", resolved.size(), date);
 		return resolved;
 	}
 
-	/** Date of the snapshot that is read by this run. */
+	/** Date of the snapshot that is written by this run. */
 	public LocalDate snapshotDate() {
 		return LocalDate.now(this.clock).minusDays(this.properties.getDateOffsetDays());
 	}
 
-	/** Target tables of {@code sync_table_config}, used for the startup log. */
+	/** Source tables of {@code sync_table_config}, used for the startup log. */
 	public List<String> configuredTables() {
-		return this.config.findEnabledTargetTables();
+		return this.config.findEnabledSourceTables();
 	}
 
 	/**
@@ -174,44 +173,33 @@ public class TableSyncService {
 			executor.shutdownNow();
 			logger.error("Interrupted while waiting for table {}", table.targetTable());
 		}
-		return new SyncResult(table.targetTable(), "FAILED", 0, 0, null, 0);
+		return new SyncResult(table.targetTable(), "FAILED", 0, 0, 0);
 	}
 
 	private SyncResult sync(SyncTable table) {
 		long startedAt = System.currentTimeMillis();
-		LocalDateTime from = null;
-		LocalDateTime to = LocalDateTime.now();
 		long written = 0;
 		long skipped = 0;
-		LocalDateTime maxTimestamp = null;
-		LocalDateTime cursorTimestamp = null;
 		Object cursorId = null;
 		try {
-			// the watermark comes from the target table itself, so this can fail when it is missing
-			from = watermark(table).map(this::minusOverlap).orElse(null);
-			logger.info("Reading {} ({}) from {}", table.sourceTable(), table.incremental() ? "incremental" : "full",
-					from);
+			long cleared = clearTarget(table);
+			if (cleared > 0) {
+				logger.info("Cleared {} row(s) of {} before the copy", cleared, table.targetTable());
+			}
+			logger.info("Reading {}", table.sourceTable());
 			while (true) {
-				boolean firstPage = cursorId == null && cursorTimestamp == null;
+				boolean firstPage = cursorId == null;
 				List<Row> page = this.sourceJdbcTemplate.query(
-						SqlBuilder.selectPage(table, firstPage, from != null, table.batchSize()),
+						SqlBuilder.selectPage(table, firstPage, table.batchSize()),
 						(rs, rowNum) -> readRow(table, rs),
-						SqlBuilder.pageArgs(table, firstPage, from != null, from, to, cursorTimestamp, cursorId)
-								.toArray());
+						SqlBuilder.pageArgs(table, firstPage, cursorId).toArray());
 				if (page.isEmpty()) {
 					break;
 				}
 				Page result = write(table, page);
 				written += result.written();
 				skipped += result.skipped();
-				Row last = page.get(page.size() - 1);
-				cursorId = last.id();
-				if (table.incremental()) {
-					cursorTimestamp = last.timestamp();
-					if (cursorTimestamp != null && (maxTimestamp == null || cursorTimestamp.isAfter(maxTimestamp))) {
-						maxTimestamp = cursorTimestamp;
-					}
-				}
+				cursorId = page.get(page.size() - 1).id();
 				if (page.size() < table.batchSize()) {
 					break;
 				}
@@ -220,33 +208,19 @@ public class TableSyncService {
 				logger.warn("{} row(s) of {} could not be written and were skipped", skipped, table.targetTable());
 			}
 			return new SyncResult(table.targetTable(), "SUCCESS", written, skipped,
-					maxTimestamp != null ? maxTimestamp : from, System.currentTimeMillis() - startedAt);
+					System.currentTimeMillis() - startedAt);
 		}
 		catch (RuntimeException ex) {
-			logger.error("Table {} failed after {} row(s), the next run retries the same range", table.targetTable(),
-					written, ex);
-			return new SyncResult(table.targetTable(), "FAILED", written, skipped, from,
+			logger.error("Table {} failed after {} row(s), the next run copies the table again",
+					table.targetTable(), written, ex);
+			return new SyncResult(table.targetTable(), "FAILED", written, skipped,
 					System.currentTimeMillis() - startedAt);
 		}
 	}
 
-	/** Highest watermark value the target table already contains, empty while it is still empty. */
-	private Optional<LocalDateTime> watermark(SyncTable table) {
-		if (!table.incremental()) {
-			return Optional.empty();
-		}
-		List<LocalDateTime> values = this.targetJdbcTemplate.query(
-				"SELECT MAX(" + table.watermarkColumn() + ") FROM " + table.targetTable(), (rs, rowNum) -> {
-					Timestamp value = rs.getTimestamp(1);
-					return value == null ? null : value.toLocalDateTime();
-				});
-		return values.isEmpty() || values.get(0) == null ? Optional.empty() : Optional.of(values.get(0));
-	}
-
-	/** Re-read the tail of the data on every run, this absorbs rows written while a run is running. */
-	private LocalDateTime minusOverlap(LocalDateTime value) {
-		Duration overlap = this.properties.getWatermarkOverlap();
-		return overlap == null ? value : value.minus(overlap);
+	/** Rows the previous run of the same day left behind, they are replaced by the new content. */
+	private long clearTarget(SyncTable table) {
+		return this.targetJdbcTemplate.update("DELETE FROM " + table.targetTable());
 	}
 
 	private Page write(SyncTable table, List<Row> page) {
@@ -289,7 +263,6 @@ public class TableSyncService {
 		List<String> columns = table.sourceColumns();
 		List<Object> values = new ArrayList<>(columns.size());
 		Object id = null;
-		LocalDateTime timestamp = null;
 		for (int index = 0; index < columns.size(); index++) {
 			String column = columns.get(index);
 			Object raw = rs.getObject(index + 1);
@@ -297,15 +270,12 @@ public class TableSyncService {
 			if (column.equalsIgnoreCase(table.idColumn())) {
 				id = raw;
 			}
-			if (table.incremental() && column.equalsIgnoreCase(table.timestampColumn())) {
-				timestamp = (LocalDateTime) this.converter.convert(raw);
-			}
 		}
 		if (id == null) {
 			throw new IllegalStateException(
 					"Cursor column " + table.idColumn() + " of " + table.sourceTable() + " is null");
 		}
-		return new Row(id, timestamp, values);
+		return new Row(id, values);
 	}
 
 	private static String message(Throwable error) {
@@ -316,7 +286,7 @@ public class TableSyncService {
 		return root.getClass().getSimpleName() + ": " + root.getMessage();
 	}
 
-	private record Row(Object id, LocalDateTime timestamp, List<Object> values) {
+	private record Row(Object id, List<Object> values) {
 
 		String idAsString() {
 			return this.id == null ? null : String.valueOf(this.id);

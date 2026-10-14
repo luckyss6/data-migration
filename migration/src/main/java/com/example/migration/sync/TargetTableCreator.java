@@ -38,11 +38,10 @@ public class TargetTableCreator {
 
 	/**
 	 * Creates the target table when it does not exist yet.
-	 * @param watermarkColumn target column the engine reads {@code MAX(...)} from, indexed afterwards
 	 * @return {@code true} when the table was created
 	 */
 	public boolean createIfMissing(String targetTable, List<SourceColumn> columns, List<String> keyColumns,
-			String watermarkColumn, String tableOptions) {
+			String tableOptions) {
 		if (tableExists(targetTable)) {
 			return false;
 		}
@@ -52,7 +51,6 @@ public class TargetTableCreator {
 		try (Connection connection = this.targetDataSource.getConnection();
 				Statement statement = connection.createStatement()) {
 			statement.execute(ddl);
-			createWatermarkIndex(connection, targetTable, watermarkColumn);
 			return true;
 		}
 		catch (SQLException ex) {
@@ -85,19 +83,6 @@ public class TargetTableCreator {
 	/** Target column name of a source column. */
 	public static String targetName(String sourceColumn) {
 		return sourceColumn.toLowerCase(Locale.ROOT);
-	}
-
-	private void createWatermarkIndex(Connection connection, String targetTable, String watermarkColumn) {
-		if (watermarkColumn == null || watermarkColumn.isBlank()) {
-			return;
-		}
-		String index = "idx_" + targetTable + "_" + watermarkColumn;
-		try (Statement statement = connection.createStatement()) {
-			statement.execute("CREATE INDEX " + index + " ON " + targetTable + " (" + watermarkColumn + ")");
-		}
-		catch (SQLException ex) {
-			logger.warn("Could not index {}.{}: {}", targetTable, watermarkColumn, ex.getMessage());
-		}
 	}
 
 	private boolean tableExists(String tableName) {

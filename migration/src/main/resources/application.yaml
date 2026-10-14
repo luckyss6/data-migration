@@ -7,14 +7,16 @@ spring:
 
 # Oracle -> MySQL synchronisation.
 #
-# Which target tables are filled is stored in the 'sync_table_config' table of the target database
-# (created automatically on the first start), one row per table:
+# Which tables are migrated is stored in the 'sync_table_config' table of the SOURCE database (Oracle);
+# that table is created by the DBA beforehand, see db/sync_table_config.sql. One row per table:
 #
-#   INSERT INTO sync_table_config (target_table) VALUES ('order');
+#   INSERT INTO sync_table_config (source_table) VALUES ('order');
 #
-# The source table of such a row is derived from its name and the run date, so the target table
-# 'order' reads the snapshot 'order20261014' on 2026-10-14. If that snapshot exists, a missing
-# target table is created from it and the data is copied afterwards.
+# The target table of such a row is derived from its name and the run date: on 2026-10-14 the Oracle
+# table 'order' is copied into the MySQL table 'order20261014'. If that table does not exist yet it is
+# created from the source table's structure before the rows are copied. Every run copies the whole
+# table; there is no watermark and no incremental mode. The target table of the run date is emptied
+# before the copy, so a second run of the same day ends with exactly the source content.
 migration:
   # daily at 02:30
   cron: "0 30 2 * * ?"
@@ -24,29 +26,24 @@ migration:
   # rows per page read from Oracle, and rows per JDBC batch written to MySQL
   batch-size: 2000
   fetch-size: 1000
-  # re-read one minute per run, this absorbs rows written while a run is in progress
-  watermark-overlap: 1m
-  # {table} = target table name, {date} = run date
-  source-table-pattern: "{table}{date}"
+  # {table} = source table name from sync_table_config, {date} = run date
+  target-table-pattern: "{table}{date}"
   date-pattern: yyyyMMdd
-  # set to -1 to read yesterday's snapshot in a nightly job
+  # set to -1 to fill yesterday's snapshot table in a nightly job
   date-offset-days: 0
-  # columns that must exist in both tables
-  timestamp-column: UPDATE_TIME
+  # column that must exist in both tables, used as the pagination cursor
   id-column: ID
-  # INCREMENTAL: only rows newer than the target table's watermark, FULL: the whole snapshot
-  sync-mode: INCREMENTAL
   # appended to a generated CREATE TABLE
   table-options: "ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
   source:
     url: ${MIGRATION_SOURCE_URL:jdbc:oracle:thin:@//localhost:1521/ORCL}
     username: ${MIGRATION_SOURCE_USERNAME:source_user}
-    password: ${MIGRATION_SOURCE_PASSWORD:}
+    password: ${MIGRATION_SOURCE_PASSWORD:source123}
     driver-class-name: oracle.jdbc.OracleDriver
   target:
     # rewriteBatchedStatements=true merges the JDBC batch into one multi-row INSERT
     url: ${MIGRATION_TARGET_URL:jdbc:mysql://localhost:3306/target_db?rewriteBatchedStatements=true&characterEncoding=utf8&serverTimezone=Asia/Shanghai}
     username: ${MIGRATION_TARGET_USERNAME:target_user}
-    password: ${MIGRATION_TARGET_PASSWORD:}
+    password: ${MIGRATION_TARGET_PASSWORD:target123}
     driver-class-name: com.mysql.cj.jdbc.Driver
     pool-size: 10

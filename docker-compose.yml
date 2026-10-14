@@ -1,0 +1,77 @@
+# 本地测试用的两个数据库：Oracle（源库） + MySQL（目标库）
+#
+#   docker compose up -d        # 启动（第一次会拉镜像 + 建库，Oracle 要等几分钟）
+#   docker compose ps           # 看状态
+#   docker compose logs -f oracle
+#   docker compose down         # 停止（数据留在 volume 里）
+#   docker compose down -v      # 停止并清空数据，下次从零建库
+#
+# 连接信息（与 migration/src/main/resources/application.yaml 的默认值对齐）：
+#   Oracle  jdbc:oracle:thin:@//localhost:1521/ORCL   source_user / source123
+#           SYS / SYSTEM 口令 Oracle123
+#   MySQL   jdbc:mysql://localhost:3306/target_db     target_user / target123
+#           root 口令 root123
+#
+# 这两个口令只为本地测试，别用在任何对外环境。
+
+name: migration-testdb
+
+services:
+  oracle:
+    image: gvenzl/oracle-xe:21-slim
+    container_name: oracle-test
+    environment:
+      # SYS / SYSTEM 口令
+      ORACLE_PASSWORD: Oracle123
+      # 额外建一个 PDB，服务名就是 ORCL，正好对上 application.yaml 里的默认 URL
+      ORACLE_DATABASE: ORCL
+      # 源库业务用户，建在 ORCL 里
+      APP_USER: source_user
+      APP_USER_PASSWORD: source123
+      TZ: Asia/Shanghai
+    ports:
+      - "1521:1521"
+    volumes:
+      - oracle-data:/opt/oracle/oradata
+    healthcheck:
+      test: ["CMD", "healthcheck.sh"]
+      interval: 20s
+      timeout: 10s
+      retries: 30
+      start_period: 180s
+    restart: unless-stopped
+
+  mysql:
+    image: mysql:8.4
+    container_name: mysql-test
+    environment:
+      MYSQL_ROOT_PASSWORD: root123
+      MYSQL_DATABASE: target_db
+      MYSQL_USER: target_user
+      MYSQL_PASSWORD: target123
+      TZ: Asia/Shanghai
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_0900_ai_ci
+      # Oracle 的标识符大小写不敏感，这里让 MySQL 也按不敏感匹配，少踩坑。
+      # 注意：这个参数只在首次建库（空数据目录）时生效。
+      - --lower-case-table-names=1
+      # 迁移工具按 batch-size 拼多行 INSERT，给大字段留点余量
+      - --max-allowed-packet=128M
+      # 与 URL 里的 serverTimezone=Asia/Shanghai 保持一致
+      - --default-time-zone=+08:00
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-proot123"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 60s
+    restart: unless-stopped
+
+volumes:
+  oracle-data:
+  mysql-data:

@@ -9,31 +9,25 @@ import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Component;
 
 /**
- * The {@code sync_table_config} table of the target database: one row per target table that has to be
- * filled. The source table of a row is derived from the target table name and the run date, see
- * {@code migration.source-table-pattern}.
+ * The {@code sync_table_config} table of the <em>source</em> database: one row per table that has to
+ * be migrated. The table is owned by the source database and created outside of this application, see
+ * {@code db/sync_table_config.sql}. Only tables that exist in the source are migrated, the matching
+ * target table is derived from the configured name and the run date, see
+ * {@code migration.target-table-pattern}.
  */
 @Component
 public class SyncTableConfigDao {
 
-	private final JdbcTemplate targetJdbcTemplate;
+	private final JdbcTemplate sourceJdbcTemplate;
 
-	public SyncTableConfigDao(@Qualifier(DataSourceConfig.TARGET_JDBC_TEMPLATE) JdbcTemplate targetJdbcTemplate) {
-		this.targetJdbcTemplate = targetJdbcTemplate;
-		createTableIfMissing();
+	public SyncTableConfigDao(@Qualifier(DataSourceConfig.SOURCE_JDBC_TEMPLATE) JdbcTemplate sourceJdbcTemplate) {
+		this.sourceJdbcTemplate = sourceJdbcTemplate;
 	}
 
-	/** Enabled target tables, in configuration order. Read on every run. */
-	public List<String> findEnabledTargetTables() {
-		return this.targetJdbcTemplate.queryForList(
-				"SELECT target_table FROM sync_table_config WHERE enabled = 1 ORDER BY id", String.class);
-	}
-
-	private void createTableIfMissing() {
-		this.targetJdbcTemplate.execute("CREATE TABLE IF NOT EXISTS sync_table_config ("
-				+ "id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY, target_table VARCHAR(100) NOT NULL, "
-				+ "enabled TINYINT NOT NULL DEFAULT 1, remark VARCHAR(500) NULL, updated_at TIMESTAMP NULL, "
-				+ "UNIQUE (target_table))");
+	/** Enabled source tables, in configuration order. Read on every run. */
+	public List<String> findEnabledSourceTables() {
+		return this.sourceJdbcTemplate.queryForList(
+				"SELECT source_table FROM sync_table_config WHERE enabled = 1 ORDER BY id", String.class);
 	}
 
 }

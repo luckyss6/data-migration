@@ -17,20 +17,18 @@ import javax.sql.DataSource;
 
 import com.example.migration.config.DataSourceConfig;
 import com.example.migration.config.MigrationProperties;
-import com.example.migration.config.MigrationProperties.Mode;
-
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.stereotype.Component;
 
 /**
- * Builds the sync plan of one configured target table:
+ * Builds the sync plan of one configured source table:
  *
  * <ol>
- * <li>derive the source table of the snapshot ({@code order -> order20261014}),</li>
- * <li>look for it in the source database - no snapshot, no sync,</li>
- * <li>create the target table when it does not exist yet,</li>
+ * <li>look for the configured table in the source database - not there, no sync,</li>
+ * <li>derive the snapshot table of the target ({@code order -> order20261014}),</li>
+ * <li>create that target table when it does not exist yet,</li>
  * <li>copy the columns both tables have in common.</li>
  * </ol>
  */
@@ -60,36 +58,29 @@ public class SyncTableFactory {
 		this.properties = properties;
 	}
 
-	/** Source table of a target table for the given date, e.g. {@code order -> order20261014}. */
-	public String sourceTable(String targetTable, LocalDate date) {
-		String pattern = this.properties.getSourceTablePattern();
+	/** Target table of a source table for the given date, e.g. {@code order -> order20261014}. */
+	public String targetTable(String sourceTable, LocalDate date) {
+		String pattern = this.properties.getTargetTablePattern();
 		if (pattern == null || !pattern.contains("{table}")) {
 			throw new IllegalStateException(
-					"'migration.source-table-pattern' has to contain {table} and may contain {date}");
+					"'migration.target-table-pattern' has to contain {table} and may contain {date}");
 		}
 		String dateText = DateTimeFormatter.ofPattern(this.properties.getDatePattern()).format(date);
-		return pattern.replace("{table}", targetTable).replace("{date}", dateText);
+		return pattern.replace("{table}", plainName(sourceTable)).replace("{date}", dateText);
 	}
 
-	/** Plan of one target table, empty when the snapshot of the run date does not exist. */
-	public Optional<SyncTable> resolve(String targetTable, LocalDate date) {
-		String sourceTable = sourceTable(targetTable, date);
+	/** Plan of one source table, empty when that table does not exist in the source database. */
+	public Optional<SyncTable> resolve(String sourceTable, LocalDate date) {
 		List<SourceColumn> sourceColumns = readSourceColumns(sourceTable);
 		if (sourceColumns.isEmpty()) {
-			logger.warn("No source table {} for target table {}, skipping it", sourceTable, targetTable);
+			logger.warn("Source table {} does not exist, skipping it", sourceTable);
 			return Optional.empty();
 		}
+		String targetTable = targetTable(sourceTable, date);
 		List<String> keyColumns = readPrimaryKeys(this.sourceDataSource, sourceTable);
 		String cursor = resolveCursor(sourceColumns, keyColumns, sourceTable);
-		String timestampColumn = null;
-		if (this.properties.getSyncMode() == Mode.INCREMENTAL) {
-			timestampColumn = resolveColumn(sourceColumns, this.properties.getTimestampColumn(),
-					"migration.timestamp-column", sourceTable);
-		}
 		List<String> keys = keyColumns.isEmpty() ? List.of(cursor) : keyColumns;
-		this.targetTableCreator.createIfMissing(targetTable, sourceColumns, keys,
-				timestampColumn == null ? null : TargetTableCreator.targetName(timestampColumn),
-				this.properties.getTableOptions());
+		this.targetTableCreator.createIfMissing(targetTable, sourceColumns, keys, this.properties.getTableOptions());
 
 		List<String> targetColumns = readColumnNames(this.targetDataSource, targetTable);
 		List<String> copiedSourceColumns = new ArrayList<>();
@@ -108,11 +99,8 @@ public class SyncTableFactory {
 			}
 		}
 		requireColumn(copiedSourceColumns, cursor, "cursor column", sourceTable, targetTable);
-		if (timestampColumn != null) {
-			requireColumn(copiedSourceColumns, timestampColumn, "watermark column", sourceTable, targetTable);
-		}
-		SyncTable table = new SyncTable(sourceTable, targetTable, timestampColumn, cursor, copiedSourceColumns,
-				copiedTargetColumns, keys, this.properties.getBatchSize());
+		SyncTable table = new SyncTable(sourceTable, targetTable, cursor, copiedSourceColumns, copiedTargetColumns, keys,
+				this.properties.getBatchSize());
 		logger.info("Resolved {}", table);
 		return Optional.of(table);
 	}
@@ -242,6 +230,12 @@ public class SyncTableFactory {
 		catch (SQLException ex) {
 			return false;
 		}
+	}
+
+	/** {@code [SCHEMA.]TABLE} reduced to {@code TABLE}, the target name must not repeat the schema. */
+	private static String plainName(String table) {
+		int dot = table.trim().lastIndexOf('.');
+		return dot > 0 ? table.trim().substring(dot + 1) : table.trim();
 	}
 
 	private record OrderedColumn(int position, SourceColumn column) {

@@ -1,25 +1,27 @@
 # Oracle → MySQL 定时数据迁移
 
-Spring Boot 定时任务，每天把 Oracle 里的快照表搬进 MySQL。核心是 `@Scheduled` + `JdbcTemplate`，
+Spring Boot 定时任务，每天把 Oracle 里配置好的表搬进 MySQL 的按日期命名的快照表。核心是 `@Scheduled` + `JdbcTemplate`，
 没有 Spring Batch / XXL-Job 等额外组件。
 
-流程：**读库里的配置表 → 拿到目标表 → 按目标表名去源库找快照 → 有就建目标表 → 再搬数据**。
+流程：**读源库的配置表 → 确认源表存在 → 推导目标表名（源表名 + 日期）→ 目标表不存在就按源表结构建 → 清空当天目标表 → 再整表搬数据**。
 
 ## 工作原理
 
-1. 读目标库的配置表 `sync_table_config`，得到需要同步的**目标表**（如 `order`）。
-2. 推导源表名：目标表名 + 日期，`order` → `order20261014`（`migration.source-table-pattern`，
-   可用 `date-offset-days: -1` 取昨天的快照）。
-3. 去源库找这张快照：**没有就跳过这张表**（打 WARN），不影响其他表。
-4. 有快照：**目标表不存在时按源表结构自动建表**（Oracle 类型 → MySQL 类型，见下表）；
+1. 读**源库（Oracle）**的配置表 `sync_table_config`，得到需要迁移的**源表**（如 `order`）。
+2. 推导目标表名：源表名 + 日期，`order` → `order20261014`（`migration.target-table-pattern`，
+   可用 `date-offset-days: -1` 写到昨天的快照表）。
+3. 确认这张源表真的存在：**没有就跳过这张表**（打 WARN），不影响其他表——配置表放在源库，
+   配的本来就是源头有的表。
+4. 源表存在：**目标表不存在时按源表结构自动建表**（Oracle 类型 → MySQL 类型，见下表）；
    已存在则完全不动它。
 5. 复制的列 = 源表与目标表的交集（按名字忽略大小写匹配）。源表多出来的列忽略并告警，
    目标表多出来的列保留默认值。
-6. 搬数据：**一张表一个线程**，最多 `migration.threads` 张表同时跑。水位 = **目标表自身的 `MAX(时间戳列)`**，
-   只搬比它新的行（再减去 `watermark-overlap`）；按 `(时间戳列, 游标列)` keyset 分页，每页一条
-   `INSERT ... ON DUPLICATE KEY UPDATE` 批量写入，重复执行不产生重复数据。
+6. 搬数据：**一张表一个线程**，最多 `migration.threads` 张表同时跑。**每次运行都整表全量重搬**，
+   没有水位、没有增量：先 `DELETE FROM <当天目标表>` 清掉这一天的旧数据，再按游标列（默认 `ID`）
+   顺序分页读取，每页一条 `INSERT ... ON DUPLICATE KEY UPDATE` 批量写入。同一天跑两遍的最终结果
+   就是源表当时的内容——源端删掉的行不会残留，也不会重复。
 7. 单条写失败 → 打日志跳过，同页其他行正常提交；整页失败或异常 → 该表失败（不影响其他表），
-   水位自然停在上次位置，下次重试。
+   下次运行再整表重搬一次。
 
 ## 目录
 
@@ -27,9 +29,9 @@ Spring Boot 定时任务，每天把 Oracle 里的快照表搬进 MySQL。核心
 src/main/java/com/example/migration/
   config/MigrationProperties.java     全局配置
   config/DataSourceConfig.java        Oracle / MySQL 两个数据源
-  sync/SyncTableConfigDao.java        sync_table_config 建表与读取
-  sync/SyncTableFactory.java          推导源表名、找快照、建计划（列交集）
-  sync/TargetTableCreator.java        按源表结构建目标表（含水位列索引）
+  sync/SyncTableConfigDao.java        读取源库的 sync_table_config（不建表）
+  sync/SyncTableFactory.java          推导目标表名、确认源表存在、建计划（列交集）
+  sync/TargetTableCreator.java        按源表结构建目标表
   sync/OracleToMySqlTypeMapper.java   Oracle → MySQL 类型映射
   sync/SyncTable.java                 解析后的同步计划
   sync/SqlBuilder.java                分页查询语句 + upsert 语句
@@ -39,21 +41,22 @@ src/main/java/com/example/migration/
   runner/SyncStartupRunner.java       启动时打印配置，可选立即跑一次
 ```
 
-## 配置表（在目标库里）
+## 配置表（在源库 Oracle 里）
 
-`sync_table_config` 由程序在目标库自动创建，一行一张目标表，每次运行前读取一次：
+`sync_table_config` 由 **DBA 在源库提前建好**（程序只读，不会建表），DDL 见 `db/sync_table_config.sql`；
+一行一张要迁移的源表，每次运行前读取一次：
 
 ```sql
-INSERT INTO sync_table_config (target_table) VALUES ('order');
+INSERT INTO sync_table_config (source_table) VALUES ('order');
 ```
 
 | 列 | 说明 |
 | --- | --- |
-| `target_table` | 要填充的目标表，唯一，如 `order` |
+| `source_table` | 要迁移的源表（Oracle），唯一，如 `order` |
 | `enabled` | 置 0 暂停该表 |
 | `remark` | 备注 |
 
-源表名不用配，由 `target_table` + 运行日期推导。
+目标表名不用配，由 `source_table` + 运行日期推导。
 
 ## 全局配置
 
@@ -63,13 +66,10 @@ migration:
   threads: 4                  # 同时同步几张表（一张表一个线程），不要超过连接池大小
   batch-size: 2000            # 每页读取行数 = 每个 JDBC 批的行数
   fetch-size: 1000            # JDBC fetch size
-  watermark-overlap: 1m       # 每次回退重读的时间
-  source-table-pattern: "{table}{date}"   # {table}=目标表名，{date}=运行日期
+  target-table-pattern: "{table}{date}"   # {table}=源表名，{date}=运行日期
   date-pattern: yyyyMMdd
-  date-offset-days: 0         # -1 表示取昨天的快照
-  timestamp-column: UPDATE_TIME   # 水位列，源表和目标表都要有
+  date-offset-days: 0         # -1 表示写到昨天那张快照表
   id-column: ID                   # 分页游标列，留空则用源表单列主键
-  sync-mode: INCREMENTAL          # 或 FULL（每次整表重读快照）
   table-options: "ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"   # 建表语句后缀
   source:
     url: jdbc:oracle:thin:@//host:1521/ORCL
@@ -99,7 +99,7 @@ migration:
 | `TIMESTAMP(n)` | `DATETIME(n)`，默认 3，最多 6 |
 | `FLOAT` / `BINARY_FLOAT` / `BINARY_DOUBLE` | `FLOAT` / `DOUBLE` |
 
-源表主键会建成目标表主键，水位列自动建索引。遇到没映射过的类型，该表会被跳过并打 ERROR 日志（可考虑手动建表）。
+源表主键会建成目标表主键。遇到没映射过的类型，该表会被跳过并打 ERROR 日志（可考虑手动建表）。
 
 ## 性能调优
 
@@ -120,8 +120,11 @@ mvn spring-boot:run -Dspring-boot.run.arguments=--sync-now  # 立刻跑一次
 java -jar target/migration-0.0.1-SNAPSHOT.jar --migration.run-on-startup=true
 ```
 
-启动日志会打印源表名规则和 `sync_table_config` 里的目标表。目标表可以完全不存在，会被自动创建；
+启动日志会打印目标表名规则和 `sync_table_config` 里的源表。目标表可以完全不存在，会被自动创建；
 自己维护目标表的话，记得主键/唯一键建在游标列上，否则 upsert 无法去重。
+
+每张源表在目标库里的名字是 `源表名 + 运行日期`（`order` → `order20261014`），所以**每天一张新表**：
+每次运行都把整张源表重搬一遍（upsert），当天多跑几次也不会产生重复数据。
 
 ## 手动触发（测试用接口）
 
@@ -129,8 +132,8 @@ java -jar target/migration-0.0.1-SNAPSHOT.jar --migration.run-on-startup=true
 
 ```bash
 curl -X POST http://localhost:8080/sync/run
-# {"status":"SUCCESS","tables":[{"table":"order","status":"SUCCESS","written":1201,"skipped":0,
-#   "watermark":"2026-10-14T08:00:00","durationMs":1843}]}
+# {"status":"SUCCESS","tables":[{"table":"order20261014","status":"SUCCESS","written":1201,"skipped":0,
+#   "durationMs":1843}]}
 ```
 
 `/sync/run` 是同步的：请求会一直等到这次任务跑完再返回每张表的结果。如果正好有一轮任务在跑，
@@ -138,25 +141,27 @@ curl -X POST http://localhost:8080/sync/run
 
 ## 测试
 
-`mvn test`（39 个用例）用 H2 的 Oracle 兼容模式当源库、MySQL 兼容模式当目标库跑整条链路。
+`mvn test`（36 个用例）用 H2 的 Oracle 兼容模式当源库、MySQL 兼容模式当目标库跑整条链路。
 
 | 测试类 | 覆盖 |
 | --- | --- |
-| `TableSyncServiceTest` | 多表并发（一表一线程）、自动建表并搬全量（1201 行分 3 页）、下次只搬新增、重复搬运不重复、已存在的目标表不被重建（多出列保留默认值、源表多出列不搬）、坏数据只跳过、整表失败不影响其他表、config 里对不上快照的行被跳过、空配置表什么都不做、CLOB 中文值搬对、无时间戳的行不进增量 |
-| `FullModeTest` | `sync-mode=FULL`：快照没有时间戳列时每次整表重读，且不产生重复行，改动的行会被更新 |
-| `OverlapWindowTest` | `watermark-overlap` 回退重读窗口：重读尾部不重复，上一轮运行期间新写入的行下一轮会被捞到 |
+| `TableSyncServiceTest` | 多表并发（一表一线程）、自动建表并搬全量（1201 行分 3 页）、每轮整表重搬且不产生重复、源表没有时间戳列也照搬、改动的行被更新、已存在的目标表不被重建（多出列保留默认值、源表多出列不搬）、坏数据只跳过、整表失败不影响其他表、config 里源表不存在的行被跳过、空配置表什么都不做、CLOB 中文值搬对、时间戳列为 NULL 的行照搬 |
 | `SyncApiTest` | `POST /sync/run` 真起 HTTP 触发并返回每表结果、数据确实落库；`GET /sync/tables` 返回配置表；空配置返回空结果；有表失败时 `status=FAILED` |
-| `SyncTableFactoryTest` | 源表名推导（默认/自定义 pattern、日期格式），pattern 缺 `{table}` 直接报错 |
+| `SyncTableFactoryTest` | 目标表名推导（默认/自定义 pattern、日期格式、带 schema 的源表名），pattern 缺 `{table}` 直接报错 |
 | `OracleToMySqlTypeMapperTest` | Oracle → MySQL 类型映射表，未知类型带列名报错 |
 | `TargetTableCreatorTest` | 生成的 `CREATE TABLE`（列、NOT NULL、主键、复合主键、表后缀） |
-| `SqlBuilderTest` | 增量/全量分页语句与参数、upsert 语句（含只有键列的表） |
+| `SqlBuilderTest` | 全量分页语句与游标参数、upsert 语句（含只有键列的表） |
 | `ValueConverterTest` | CLOB/BLOB/时间/大数/字符的类型转换 |
 
 ## 已知限制
 
-- 时间戳方案捕获不到物理删除；需要同步删除请改用逻辑删除列或触发器等方案。
-- 增量模式下每张源表都必须有时间戳列（否则该表被跳过并记 ERROR），没有该列的表请用 `FULL` 模式。
-- 被跳过的记录只留在日志里，不会自动重试（水位已经越过它）；补数时把该行时间戳改大，或临时调小目标表的
-  `MAX(时间戳列)` 让它重新进入范围。
-- 水位取自目标表的 `MAX(时间戳列)`，所以不要往目标表写比源端更新的时间戳。
-- 应用与数据库的时钟偏差由 `watermark-overlap` 兜底。
+- 配置表在源库里，程序只读、**不会自动建表**：先执行 `db/sync_table_config.sql` 建好，否则启动时
+  会告警、手动触发 `/sync/run` 会直接报错。
+- 目标表名带运行日期，因此**目标库里的表会按天累积**，需要自己定保留策略（例如 DROP 掉 N 天前的表）。
+- 源表不存在、或者缺少配置的游标列（默认 `ID`）时，该表在解析阶段被跳过，只会打日志，
+  不会出现在 `/sync/run` 的返回里。
+- 每天一张目标表；**同一天重复运行会先清空当天目标表再整表重灌**，所以源端删掉的行不会残留。
+  代价是：某一轮如果清空之后失败，当天目标表会停在"部分数据"的状态，下一轮会重新清空重来
+  （不会自动回滚到上一轮的完整状态）。
+- 清空用的是 `DELETE FROM`（可回滚、不要求额外权限），表特别大的话可以改成 `TRUNCATE TABLE` 提速。
+- 被跳过的记录只留在日志里不会自动重试；因为每轮都是整表重搬，只要修好数据下一轮就会带上。

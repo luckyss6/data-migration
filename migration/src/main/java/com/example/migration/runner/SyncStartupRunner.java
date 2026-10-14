@@ -32,25 +32,25 @@ public class SyncStartupRunner implements ApplicationRunner {
 	@Override
 	public void run(ApplicationArguments args) {
 		logger.info("Source {} -> target {}", this.properties.getSource().getUrl(), this.properties.getTarget().getUrl());
-		logger.info("Cron '{}', threads={}, batchSize={}, fetchSize={}, watermarkOverlap={}", this.properties.getCron(),
-				this.properties.getThreads(), this.properties.getBatchSize(), this.properties.getFetchSize(),
-				this.properties.getWatermarkOverlap());
+		logger.info("Cron '{}', threads={}, batchSize={}, fetchSize={}", this.properties.getCron(),
+				this.properties.getThreads(), this.properties.getBatchSize(), this.properties.getFetchSize());
 		warnAboutPoolSizes();
 		warnAboutBatchRewriting();
-		logger.info("Source table pattern '{}' (date pattern '{}', offset {} day(s)), mode {}",
-				this.properties.getSourceTablePattern(), this.properties.getDatePattern(),
-				this.properties.getDateOffsetDays(), this.properties.getSyncMode());
+		logger.info("Full copy on every run, target table pattern '{}' (date pattern '{}', offset {} day(s))",
+				this.properties.getTargetTablePattern(), this.properties.getDatePattern(),
+				this.properties.getDateOffsetDays());
 		try {
-			List<String> targetTables = this.syncService.configuredTables();
-			if (targetTables.isEmpty()) {
-				logger.warn("sync_table_config is empty, nothing will be synchronised");
+			List<String> sourceTables = this.syncService.configuredTables();
+			if (sourceTables.isEmpty()) {
+				logger.warn("sync_table_config of the source is empty, nothing will be synchronised");
 			}
 			else {
-				logger.info("{} target table(s) in sync_table_config: {}", targetTables.size(), targetTables);
+				logger.info("{} source table(s) in sync_table_config: {}", sourceTables.size(), sourceTables);
 			}
 		}
 		catch (RuntimeException ex) {
-			logger.warn("Could not read sync_table_config: {}", ex.getMessage());
+			logger.warn("Could not read sync_table_config, create it with db/sync_table_config.sql: {}",
+					ex.getMessage());
 		}
 		if (this.properties.isRunOnStartup() || args.containsOption("sync-now")) {
 			logger.info("Running one synchronisation on startup");

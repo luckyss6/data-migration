@@ -8,13 +8,10 @@ migration:
   threads: 2
   batch-size: 500
   fetch-size: 50
-  watermark-overlap: 0s
-  source-table-pattern: "{table}{date}"
+  target-table-pattern: "{table}{date}"
   date-pattern: yyyyMMdd
   date-offset-days: 0
-  timestamp-column: UPDATE_TIME
   id-column: ID
-  sync-mode: INCREMENTAL
   table-options: ""
   source:
     url: jdbc:h2:mem:migration_source;MODE=Oracle;DB_CLOSE_DELAY=-1
