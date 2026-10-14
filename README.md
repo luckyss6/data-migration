@@ -136,6 +136,10 @@ migration:
 
 源表主键会建成目标表主键。遇到没映射过的类型，该表会被跳过并打 ERROR 日志（可考虑手动建表）。
 
+`TIMESTAMP(n)` → `DATETIME(n)` 是**四舍五入**：源端 `.123456789` 落到目标端是 `.123457`，
+而 `.999999999` 会进位到下一秒（跨天跨月时会变成第二天，例如 `2026-02-28 23:59:59.999999999`
+→ `2026-03-01 00:00:00.000000`）。要"只截断"就得在写库前自己截到微秒。
+
 ## 方案：用配置表里的 DDL 建目标表（待实现）
 
 > **本节只是设计稿，代码尚未实现**，现有行为以上文为准。
@@ -350,6 +354,13 @@ curl -X POST http://localhost:8080/sync/run
 
 ## 已知限制
 
+- **`TIMESTAMP` 列必须先打开 ojdbc 的标准类型开关**，否则整表 FAILED：ojdbc 默认把 `TIMESTAMP`
+  读成私有类型 `oracle.sql.TIMESTAMP`（不是 `java.sql.Timestamp`），写 MySQL 时被当成 Java 序列化字节
+  （`Incorrect datetime value: '\xAC\xED\x00\x05sr\x00\x14oracle.sql.TIMESTAMP…'`）。在源库连接上加
+  `oracle.jdbc.J2EE13Compliant=true` 即可 —— 写成 JVM 参数 `-Doracle.jdbc.J2EE13Compliant=true`，
+  或写成 URL 参数 `jdbc:oracle:thin:@//host:1521/ORCL?oracle.jdbc.J2EE13Compliant=true`（两种都验过）。
+  `DATE` 列不受这个开关影响；但 `TIMESTAMP WITH TIME ZONE` **开关也救不了**，仍需要改代码
+  （见 `db-test/test-report.md` 第五轮）。
 - 配置表在源库里，程序只读、**不会自动建表**：先执行 `db/sync_table_config.sql` 建好，否则启动时
   会告警、手动触发 `/sync/run` 会直接报错。
 - 目标表名带运行日期，因此**目标库里的表会按天累积**，需要自己定保留策略（例如 DROP 掉 N 天前的表）。
