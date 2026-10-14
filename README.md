@@ -5,6 +5,38 @@ Spring Boot 定时任务，每天把 Oracle 里配置好的表搬进 MySQL 的�
 
 流程：**读源库的配置表 → 确认源表存在 → 推导目标表名（源表名 + 日期）→ 目标表不存在就按源表结构建 → 清空当天目标表 → 再整表搬数据**。
 
+## 运行环境与技术栈
+
+| 项目 | 版本 | 说明 |
+| --- | --- | --- |
+| JDK | **17** | `pom.xml` 里 `<java.version>17</java.version>`，编译目标就是 17，本机要装 JDK 17+ |
+| Maven | 3.10.x | 仓库自带 wrapper（`mvnw` / `mvnw.cmd`，指向 apache-maven 3.10.0），不需要本机预装 Maven |
+| Spring Boot | 4.1.1 | 由 `spring-boot-starter-parent` 统一管理版本，下面的依赖大多不用写版本号 |
+| 源库 | Oracle（11g 及以上） | 测试环境用 `gvenzl/oracle-xe:21-slim`，见 `docker-compose.yml` |
+| 目标库 | MySQL 8.x | 测试环境用 `mysql:8.4`；建表默认 `ENGINE=InnoDB DEFAULT CHARSET=utf8mb4` |
+
+### pom 依赖
+
+`migration/pom.xml` 里的依赖一览（版本来自 parent 的统一管理，只有驱动显式写了版本）：
+
+| 依赖 | 版本 | scope | 用途 |
+| --- | --- | --- | --- |
+| `org.springframework.boot:spring-boot-starter-jdbc` | 4.1.1 | compile | `JdbcTemplate` + HikariCP 连接池，迁移主流程全靠它 |
+| `org.springframework.boot:spring-boot-starter-webmvc` | 4.1.1 | compile | `/sync/run`、`/sync/tables` 手动触发接口 |
+| `com.oracle.database.jdbc:ojdbc11` | 21.9.0.0 | runtime | Oracle 源库 JDBC 驱动 |
+| `com.mysql:mysql-connector-j` | 8.3.0 | runtime | MySQL 目标库 JDBC 驱动 |
+| `org.springframework.boot:spring-boot-starter-test` | 4.1.1 | test | JUnit 5 + AssertJ + MockMvc |
+| `com.h2database:h2` | 2.1.214 | test | 测试用源/目标库（Oracle、MySQL 兼容模式） |
+
+两个驱动都是 `runtime`：编译期只靠 JDBC 标准 API，装上驱动就能跑；跑测试只用 H2，不需要真的连 Oracle/MySQL。
+
+构建与运行：
+
+```bash
+./mvnw clean package          # Windows 用 mvnw.cmd
+java -jar target/migration-0.0.1-SNAPSHOT.jar
+```
+
 ## 工作原理
 
 1. 读**源库（Oracle）**的配置表 `sync_table_config`，得到需要迁移的**源表**（如 `order`）。
@@ -113,6 +145,8 @@ migration:
 单表数据量很大时，把 `batch-size` 调到 5000 左右；表很多时优先加 `threads`。
 
 ## 运行
+
+本机需要 JDK 17（`java -version` 确认）；没有 Maven 的话把下面的 `mvn` 换成仓库自带的 `./mvnw`（Windows 用 `mvnw.cmd`）。
 
 ```bash
 mvn spring-boot:run                                        # 常驻，按 cron 触发
