@@ -90,6 +90,9 @@ INSERT INTO sync_table_config (source_table) VALUES ('order');
 
 目标表名不用配，由 `source_table` + 运行日期推导。
 
+> 计划新增 `ddl` 等列：当迁移账号读不到数据字典（拿不到源表的字段/索引）时，用配置表里的
+> 建表语句来建目标表。设计见《[方案：用配置表里的 DDL 建目标表](#方案用配置表里的-ddl-建目标表待实现)（待实现）》。
+
 ## 全局配置
 
 ```yaml
@@ -132,6 +135,147 @@ migration:
 | `FLOAT` / `BINARY_FLOAT` / `BINARY_DOUBLE` | `FLOAT` / `DOUBLE` |
 
 源表主键会建成目标表主键。遇到没映射过的类型，该表会被跳过并打 ERROR 日志（可考虑手动建表）。
+
+## 方案：用配置表里的 DDL 建目标表（待实现）
+
+> **本节只是设计稿，代码尚未实现**，现有行为以上文为准。
+
+### 背景与约束
+
+现在"目标表结构"是靠 JDBC 元数据（`DatabaseMetaData.getColumns` / `getPrimaryKeys`）从源库**推导**出来的。
+如果迁移账号只有业务表的 `SELECT` 权限、没有数据字典权限（`ALL_TAB_COLUMNS` / `ALL_CONS_COLUMNS` /
+`ALL_INDEXES` 等），这些调用会**返回空或者直接报错**：拿不到字段、精度、可空性，也拿不到主键/唯一键，
+于是目标表根本建不出来。
+
+### 核心思路
+
+把"源表结构"从**运行时探测**改成**配置里声明**：
+
+1. DBA 把源表的建表语句（`CREATE TABLE`，即 DDL）填进配置表 `sync_table_config.ddl`；
+2. 程序**只解析这段 DDL**，不查数据字典 —— 列、类型、精度、可空性、主键全部来自 DDL；
+3. 先校验这段 DDL（语法 + 是否和源表对得上），校验通过才用它在 MySQL 建当天的目标表；
+4. 搬运逻辑完全不变：整表分页读 + `INSERT ... ON DUPLICATE KEY UPDATE`，每轮先清空当天目标表。
+
+一句话：**配置表里的 DDL 是目标表结构的唯一来源，数据字典权限不再需要。**
+
+### 配置表改造
+
+`db/sync_table_config.sql` 增加下面几列（程序仍然只读，不建表、不回写）：
+
+```sql
+ALTER TABLE sync_table_config ADD (
+  ddl         CLOB,           -- 源表的 CREATE TABLE 语句（推荐裁剪成「列 + 主键」最小集合）
+  id_column   VARCHAR2(128),  -- 可选：该表的分页游标列，留空用全局 migration.id-column
+  key_columns VARCHAR2(500)   -- 可选：手工指定目标表的主键列（DDL 里没写主键时用）
+);
+
+COMMENT ON COLUMN sync_table_config.ddl IS '源表建表语句；迁移账号无数据字典权限时，目标表结构以它为准';
+```
+
+一行还是一张表，示例：
+
+```sql
+INSERT INTO sync_table_config (source_table, ddl) VALUES (
+  'order',
+  'CREATE TABLE "ORDER" (
+     ID          NUMBER(10) NOT NULL,
+     ORDER_NO    VARCHAR2(60) NOT NULL,
+     AMOUNT      NUMBER(12,2),
+     REMARK      CLOB,
+     UPDATE_TIME TIMESTAMP(3),
+     CONSTRAINT PK_ORDER PRIMARY KEY (ID)
+   )');
+```
+
+| 列 | 必填 | 说明 |
+| --- | --- | --- |
+| `source_table` | 是 | 源表名（Oracle），必须和 DDL 里的表名一致（忽略 schema 与引号） |
+| `ddl` | 是（新） | 源表建表语句；`DBMS_METADATA.GET_DDL` 导出的完整 DDL 也能喂进来，多余子句会被忽略 |
+| `id_column` | 否（新） | 该表的游标列，覆盖全局 `migration.id-column`；留空则用 DDL 里的主键 |
+| `key_columns` | 否（新） | 目标表主键列，逗号分隔；只在 DDL 没带主键时用 |
+| `enabled` / `remark` / `updated_at` | 否 | 同现在 |
+
+### 校验流程
+
+每一步的失败都只影响**这一张表**，其他表照跑：
+
+| # | 步骤 | 做什么 | 需要权限 | 不通过时 |
+| --- | --- | --- | --- | --- |
+| 1 | 结构预检（本地，不连库） | 必须是单条 `CREATE TABLE`；DDL 里的表名与 `source_table` 一致；括号配平；至少一列；每个列的类型都能映射（见《自动建表的类型映射》）；主键列必须出现在列清单里 | 无，纯文本解析 | 该表 ERROR 跳过 |
+| 2 | 存在性 + 列比对（源库） | `SELECT <DDL 里的列> FROM <源表> WHERE 1=0`，用 `ResultSetMetaData` 取列名/类型/精度/可空性，**不碰数据字典** | 源表 `SELECT` | 报 `ORA-00942` → 表不存在或没权限，跳过；**DDL 有、表里没有**的列 → 该表失败（DDL 过期）；**表里有、DDL 没有**的列 → WARN 并忽略该列（沿用"只搬交集"） |
+| 3 | 语法硬校验（可选） | `DBMS_SQL.PARSE(cursor, ddl, DBMS_SQL.NATIVE)`：只解析、不执行，能挡掉 DDL 文本损坏 | `EXECUTE ON DBMS_SQL` | 解析报错 → 该表跳过；没这个授权就跳过本步，降级为 1+2 |
+| 4 | 目标端预演（可选） | 把生成的 MySQL DDL 先建成 `<目标表名>__ddlchk` 再 `DROP`；也可以不预演，直接建当天的目标表（失败即该表 FAILED） | 目标库 `CREATE`/`DROP` | 建表失败 → 该表 FAILED，其他表继续 |
+| 5 | 可观测 | 每张表的"结构来源（ddl/metadata）+ 校验结论"进日志和 `/sync/run` 返回 | — | 不回写配置表（保持"程序只读配置表"的约束） |
+
+另外在**启动时**把配置表里所有表过一遍第 1 步（可选带第 2 步），一次性列出"缺 `ddl` / DDL 不合法"的表，
+别等到凌晨 02:30 才发现。
+
+### DDL 解析规则
+
+**支持**：
+
+- `CREATE [GLOBAL TEMPORARY] TABLE [schema.]name (...)`
+- 列定义：`列名 类型[(精度[,小数位])] [DEFAULT …] [NOT NULL]`，类型允许带字符语义，如 `VARCHAR2(60 CHAR)`
+- 键定义：表级 `[CONSTRAINT 名] PRIMARY KEY (列, …)` / `UNIQUE (列, …)`；列内联 `PRIMARY KEY` / `NOT NULL`
+- 双引号标识符（`"ORDER"`，保留大小写）、`--` 与 `/* */` 注释、多行与多余空白
+
+**忽略（只打 DEBUG 日志）**：`TABLESPACE`、`STORAGE`、`SEGMENT CREATION`、`PCTFREE`、`INITRANS`、
+`PARTITION BY …`（只建普通表）、`LOB (…) STORE AS …`、`USING INDEX …`、`ENABLE`、表/列的 `COMMENT`。
+
+**明确不支持（报错跳过，不猜）**：`CREATE TABLE … AS SELECT`、`CREATE TABLE … OF 类型`、虚拟列、
+`IDENTITY`/`GENERATED AS IDENTITY` 列（要么 DBA 从 DDL 里去掉，要么明确决定转成 `AUTO_INCREMENT`，
+并单独评估它和 upsert 语义的配合）。
+
+**类型映射**复用《自动建表的类型映射》那张表，只是输入从 JDBC 元数据换成 DDL 里的类型文本。
+MySQL 侧的表名/列名统一加反引号（顺带修掉保留字列名，如 `order`、`key`、`empty`）；
+Oracle 侧按 DDL 里是否带双引号决定要不要加引号。
+
+### 与现有代码的衔接
+
+| 组件 | 变化 |
+| --- | --- |
+| `db/sync_table_config.sql` | 增加 `ddl` / `id_column` / `key_columns` 列与注释 |
+| `SyncTableConfigDao` | 多读上面几列（`ddl` 按 CLOB 读） |
+| `OracleDdlParser`（新类） | DDL → 列清单（名字/类型/精度/可空）+ 主键 + 表名 |
+| `SyncTableFactory` | 有 `ddl` 走新路径；没有 `ddl` 回落到现在的 `DatabaseMetaData` 路径并打 WARN 提示补 DDL |
+| `SyncTableFactory`（存在性/列比对） | 由 `getColumns` / `getPrimaryKeys` 换成 `SELECT … WHERE 1=0` + `ResultSetMetaData` |
+| `OracleToMySqlTypeMapper` | 入参由 JDBC 元数据换成解析出来的类型文本，映射规则不变 |
+| `TargetTableCreator` | 逻辑不变，只是入参来自解析结果 |
+| `TableSyncService` | 不变（分页读 + upsert + 每轮整表重搬） |
+| `SyncTable` / `SyncResult` | 增加"结构来源（ddl/metadata）"与校验结论，方便日志和 `/sync/run` 排查 |
+
+### 权限清单（给 DBA 看）
+
+- 源库：业务表 `SELECT`（现在就需要）+ `sync_table_config` 的 `SELECT`；**不需要**任何数据字典/DBA 视图权限；
+  可选 `EXECUTE ON DBMS_SQL`（只用于第 3 步硬校验）。
+- 目标库：目标库上的 `CREATE` / `DROP` / `INSERT` / `DELETE`（现在就需要）。
+
+### 取舍与风险
+
+- **DDL 与实际表漂移**：第 2 步只能比对列名，类型/长度漂移只告警；建议改表时同步更新 `ddl`，
+  或用导出脚本定期刷新这一列。
+- **主键来源**：DDL 没带主键时目标表没有主键，`ON DUPLICATE KEY UPDATE` 退化成普通 `INSERT`
+  （每轮先 `DELETE`，同一天重跑仍不会重复，但"重跑保护"变弱）→ 建议强制要求 DDL 带主键，或用 `key_columns` 指定。
+- **游标列**：改用 DDL 的主键当游标是天然唯一的；若用 `id_column` 覆盖，就要额外校验唯一性，
+  否则会踩《边界测试发现的已知缺陷》里的第 1 条（游标值重复会静默丢行）。
+- **只建「列 + 主键」**：索引、外键、触发器、分区、列注释都不迁移，需要就在目标库手工建。
+- **CLOB 长度**：`DBMS_METADATA` 导出的 DDL 可能几百行，程序只解析、不落文件，日志只打前若干行。
+- **灰度**：只在填了 `ddl` 的表上生效，没填的表继续走元数据路径，可以逐表切换。
+
+### 实施顺序
+
+1. 配置表加列 + DAO 读列（不改变任何现有行为）。
+2. `OracleDdlParser` + 单测（各种 DDL 片段：引号、注释、多余子句、缺主键）。
+3. 校验第 1+2 步，失败时跳过该表、并在 `/sync/run` 里可见。
+4. 生成 MySQL DDL 并接到 `TargetTableCreator`（只在有 `ddl` 的表上生效）。
+5. 可选：`DBMS_SQL` 硬校验、目标端预演、`id_column` 唯一性校验。
+6. 文档与 `db-test` 用例同步：DDL 与表不一致、DDL 缺主键、保留字列名、超长 DDL、DDL 过期。
+
+### 待确认
+
+- `ddl` 由谁产出：DBA 手工裁剪，还是提供一段 `DBMS_METADATA.GET_DDL` 的导出脚本？
+- 是否**强制**要求 DDL 带 `PRIMARY KEY`？
+- 源表里的 `IDENTITY` / 序列列要不要在 MySQL 侧保留自增语义？
 
 ## 性能调优
 
