@@ -1,0 +1,52 @@
+spring:
+  application:
+    name: migration
+  # The scheduler and the REST API (see SyncController) keep the application running.
+  main:
+    keep-alive: true
+
+# Oracle -> MySQL synchronisation.
+#
+# Which target tables are filled is stored in the 'sync_table_config' table of the target database
+# (created automatically on the first start), one row per table:
+#
+#   INSERT INTO sync_table_config (target_table) VALUES ('order');
+#
+# The source table of such a row is derived from its name and the run date, so the target table
+# 'order' reads the snapshot 'order20261014' on 2026-10-14. If that snapshot exists, a missing
+# target table is created from it and the data is copied afterwards.
+migration:
+  # daily at 02:30
+  cron: "0 30 2 * * ?"
+  # how many tables are copied at the same time, one thread per table
+  # (keep it <= the connection pool sizes below)
+  threads: 4
+  # rows per page read from Oracle, and rows per JDBC batch written to MySQL
+  batch-size: 2000
+  fetch-size: 1000
+  # re-read one minute per run, this absorbs rows written while a run is in progress
+  watermark-overlap: 1m
+  # {table} = target table name, {date} = run date
+  source-table-pattern: "{table}{date}"
+  date-pattern: yyyyMMdd
+  # set to -1 to read yesterday's snapshot in a nightly job
+  date-offset-days: 0
+  # columns that must exist in both tables
+  timestamp-column: UPDATE_TIME
+  id-column: ID
+  # INCREMENTAL: only rows newer than the target table's watermark, FULL: the whole snapshot
+  sync-mode: INCREMENTAL
+  # appended to a generated CREATE TABLE
+  table-options: "ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
+  source:
+    url: ${MIGRATION_SOURCE_URL:jdbc:oracle:thin:@//localhost:1521/ORCL}
+    username: ${MIGRATION_SOURCE_USERNAME:source_user}
+    password: ${MIGRATION_SOURCE_PASSWORD:}
+    driver-class-name: oracle.jdbc.OracleDriver
+  target:
+    # rewriteBatchedStatements=true merges the JDBC batch into one multi-row INSERT
+    url: ${MIGRATION_TARGET_URL:jdbc:mysql://localhost:3306/target_db?rewriteBatchedStatements=true&characterEncoding=utf8&serverTimezone=Asia/Shanghai}
+    username: ${MIGRATION_TARGET_USERNAME:target_user}
+    password: ${MIGRATION_TARGET_PASSWORD:}
+    driver-class-name: com.mysql.cj.jdbc.Driver
+    pool-size: 10
