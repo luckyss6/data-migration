@@ -22,7 +22,7 @@ Spring Boot 定时任务，每天把 Oracle 里配置好的表搬进 MySQL 的�
 | 依赖 | 版本 | scope | 用途 |
 | --- | --- | --- | --- |
 | `org.springframework.boot:spring-boot-starter-jdbc` | 4.1.1 | compile | `JdbcTemplate` + HikariCP 连接池，迁移主流程全靠它 |
-| `org.springframework.boot:spring-boot-starter-webmvc` | 4.1.1 | compile | `/sync/run`、`/sync/tables` 手动触发接口 |
+| `org.springframework.boot:spring-boot-starter-webmvc` | 4.1.1 | compile | `POST /sync/run` 手动触发接口 |
 | `com.oracle.database.jdbc:ojdbc11` | 21.9.0.0 | runtime | Oracle 源库 JDBC 驱动 |
 | `com.mysql:mysql-connector-j` | 8.3.0 | runtime | MySQL 目标库 JDBC 驱动 |
 | `org.springframework.boot:spring-boot-starter-test` | 4.1.1 | test | JUnit 5 + AssertJ + MockMvc |
@@ -175,17 +175,34 @@ curl -X POST http://localhost:8080/sync/run
 
 ## 测试
 
-`mvn test`（36 个用例）用 H2 的 Oracle 兼容模式当源库、MySQL 兼容模式当目标库跑整条链路。
+`mvn test`（60 个用例）用 H2 的 Oracle 兼容模式当源库、MySQL 兼容模式当目标库跑整条链路。
+其中 6 个用例标了 `@Disabled`：它们是边界测试复现出来的**已知缺陷**，修掉之前不要打开
+（`./mvnw test -Djunit.jupiter.conditions.deactivate=org.junit.*DisabledCondition` 可以强制跑一遍，
+看到真实失败）。
 
 | 测试类 | 覆盖 |
 | --- | --- |
 | `TableSyncServiceTest` | 多表并发（一表一线程）、自动建表并搬全量（1201 行分 3 页）、每轮整表重搬且不产生重复、源表没有时间戳列也照搬、改动的行被更新、已存在的目标表不被重建（多出列保留默认值、源表多出列不搬）、坏数据只跳过、整表失败不影响其他表、config 里源表不存在的行被跳过、空配置表什么都不做、CLOB 中文值搬对、时间戳列为 NULL 的行照搬 |
-| `SyncApiTest` | `POST /sync/run` 真起 HTTP 触发并返回每表结果、数据确实落库；`GET /sync/tables` 返回配置表；空配置返回空结果；有表失败时 `status=FAILED` |
+| `SyncApiTest` | `POST /sync/run` 真起 HTTP 触发并返回每表结果、数据确实落库；空配置返回空结果；有表失败时 `status=FAILED` |
 | `SyncTableFactoryTest` | 目标表名推导（默认/自定义 pattern、日期格式、带 schema 的源表名），pattern 缺 `{table}` 直接报错 |
 | `OracleToMySqlTypeMapperTest` | Oracle → MySQL 类型映射表，未知类型带列名报错 |
 | `TargetTableCreatorTest` | 生成的 `CREATE TABLE`（列、NOT NULL、主键、复合主键、表后缀） |
 | `SqlBuilderTest` | 全量分页语句与游标参数、upsert 语句（含只有键列的表） |
 | `ValueConverterTest` | CLOB/BLOB/时间/大数/字符的类型转换 |
+| `BoundaryCasesTest` | 分页边界（整页、整页+1、两整页、跳跃主键、单行、空表、单列表、微秒时间戳、目标表列序不同）、游标列重复或为 NULL、空白的 `id-column`、`date-offset-days`、`threads: 0`、`batch-size` 为 0 或负数；6 个 `@Disabled` 用例复现已知缺陷，见下 |
+
+### 边界测试发现的已知缺陷
+
+6 个 `@Disabled` 用例各自钉住一条，名字和 `@Disabled` 的说明就是缺陷描述：
+
+| 用例 | 现象 |
+| --- | --- |
+| `rowsThatShareTheCursorValueAreNotSilentlyDropped` | 游标列值重复时（10 行同值、`batch-size: 4`）只搬 4 行，却报 `SUCCESS`——分页只用 `>` 比较，从不检查游标列唯一性 |
+| `rowsAreNotLostWhenTheCursorRepeatsAcrossAPageBoundary` | 游标值跨页重复时同样静默丢行（6 行只搬 4 行） |
+| `aNegativeDateOffsetWritesYesterdaysSnapshotTable` | `date-offset-days: -1` 写的是**明天**那张表（代码是 `minusDays(offset)`），与本文档和 `application.yaml` 的说明相反 |
+| `aSingleRowTableThatCannotBeWrittenIsReportedAsFailed` | 只有 1 行的表写不进去时报 `SUCCESS`（`written=0 skipped=1`），因为 `writeOneByOne` 只在页内行数 > 1 时才判失败 |
+| `aZeroBatchSizeDoesNotSilentlyCopyNothing` | `batch-size: 0` 时一行不搬、目标表为空，却报 `SUCCESS`，和"源表本来就没数据"无法区分 |
+| `theSameTableConfiguredUnderTwoCasingsIsNotCopiedByTwoThreadsAtOnce` | 配置表里写 `t_case` 和 `T_CASE` 两行会解析成同一张目标表（MySQL `lower_case_table_names=1`），两个线程同时清空/写入同一张表 |
 
 ## 已知限制
 
